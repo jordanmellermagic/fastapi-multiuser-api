@@ -1,58 +1,100 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from datetime import date
+from datetime import datetime, date
 
 app = FastAPI()
 
-# 🚨 CORS FIX — required for React to reach your API
+# ------------------------------------------------
+# 🚨 CORS FIX – REQUIRED FOR REACT TO ACCESS API
+# ------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or specify ["https://react-cy52.onrender.com"]
+    allow_origins=["*"],  # You can restrict later if you want
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-app = FastAPI()
-
-# Temporary in-memory database
-db = {}
-
-class User(BaseModel):
+# ------------------------------------------------
+# 🧩 DATA MODEL
+# ------------------------------------------------
+class Person(BaseModel):
     first_name: str = ""
     last_name: str = ""
     phone_number: str = ""
-    birthday: str = ""   # YYYY-MM-DD
-    days_alive: int = 0
+    birthday: str = ""     # YYYY-MM-DD string
+    days_alive: int = 0    # auto-calculated on save
     address: str = ""
     note_name: str = ""
     screenshot_base64: str = ""
     command: str = ""
 
+
+# ------------------------------------------------
+# 💾 In-memory “database”
+# ------------------------------------------------
+db: dict[str, Person] = {}
+
+
+# ------------------------------------------------
+# 🔢 Helper: calculate days alive
+# ------------------------------------------------
+def compute_days_alive(birthday_str: str) -> int:
+    """
+    Returns number of days alive based on YYYY-MM-DD string.
+    Returns 0 if invalid or empty.
+    """
+    if not birthday_str:
+        return 0
+
+    try:
+        bday = datetime.strptime(birthday_str, "%Y-%m-%d").date()
+        today = date.today()
+        return (today - bday).days
+    except Exception:
+        return 0
+
+
+# ------------------------------------------------
+# 🟢 GET /user/{user_id}
+# ------------------------------------------------
 @app.get("/user/{user_id}")
-async def get_user(user_id: str):
+def get_user(user_id: str):
     if user_id not in db:
         raise HTTPException(status_code=404, detail="User not found")
     return db[user_id]
 
+
+# ------------------------------------------------
+# 🟡 POST /user/{user_id}
+# ------------------------------------------------
 @app.post("/user/{user_id}")
-async def set_user(user_id: str, user: User):
-    # Auto-calc days_alive if birthday is valid
-    if user.birthday:
-        try:
-            bday = datetime.strptime(user.birthday, "%Y-%m-%d").date()
-            today = date.today()
-            user.days_alive = (today - bday).days
-        except:
-            user.days_alive = 0
+def set_user(user_id: str, payload: Person):
 
-    db[user_id] = user.dict()
-    return {"status": "ok", "user": db[user_id]}
+    # Auto-calc days alive on every POST
+    days = compute_days_alive(payload.birthday)
+    payload.days_alive = days
 
+    # Save to "database"
+    db[user_id] = payload
+    return {"status": "saved", "user_id": user_id, "data": payload}
+
+
+# ------------------------------------------------
+# 🔴 DELETE /user/{user_id}
+# ------------------------------------------------
 @app.delete("/user/{user_id}")
-async def delete_user(user_id: str):
+def delete_user(user_id: str):
     if user_id in db:
         del db[user_id]
-    return {"status": "deleted"}
+        return {"status": "deleted", "user_id": user_id}
+    raise HTTPException(status_code=404, detail="User not found")
+
+
+# ------------------------------------------------
+# 🏠 ROOT (Optional)
+# ------------------------------------------------
+@app.get("/")
+def root():
+    return {"status": "FastAPI alive", "users": list(db.keys())}
