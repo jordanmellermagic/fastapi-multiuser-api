@@ -1,6 +1,19 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from datetime import date, datetime
+from datetime import date
+
+app = FastAPI()
+
+# 🚨 CORS FIX — required for React to reach your API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or specify ["https://react-cy52.onrender.com"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 app = FastAPI()
 
