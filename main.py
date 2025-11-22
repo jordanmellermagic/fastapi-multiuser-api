@@ -2,6 +2,23 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime, date
+from fastapi import FastAPI
+from pydantic import BaseModel
+from push import send_push
+
+app = FastAPI()
+
+# TEMP: store subscriptions in memory
+# (You will later tie this to user records)
+PUSH_SUBSCRIPTIONS = []
+
+class SubscriptionModel(BaseModel):
+    subscription: dict
+
+@app.post("/push/subscribe")
+def save_subscription(data: SubscriptionModel):
+    PUSH_SUBSCRIPTIONS.append(data.subscription)
+    return {"ok": True}
 
 app = FastAPI()
 
