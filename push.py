@@ -1,8 +1,9 @@
-import json
+import os
 from pywebpush import webpush, WebPushException
+import json
 
-VAPID_PRIVATE_KEY = "YOUR_VAPID_PRIVATE_KEY"
-VAPID_PUBLIC_KEY = "YOUR_VAPID_PUBLIC_KEY"
+VAPID_PUBLIC_KEY = os.getenv("VAPID_PUBLIC_KEY")
+VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY")
 
 def send_push(subscription, title, body):
     try:
