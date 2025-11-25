@@ -66,16 +66,15 @@ class User(Base):
 
     subscriptions = relationship("PushSubscription", back_populates="user", cascade="all, delete-orphan")
 
-
 class PushSubscription(Base):
     __tablename__ = "push_subscriptions"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String)
+
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"))
     subscription_json = Column(Text, nullable=False)
 
     user = relationship("User", back_populates="subscriptions")
-
 
 def get_db():
     db = SessionLocal()
