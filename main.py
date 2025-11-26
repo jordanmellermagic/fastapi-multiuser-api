@@ -1,10 +1,19 @@
 import os
 import shutil
+import uuid
 import calendar
 from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    UploadFile,
+    File,
+    Form,
+    Depends,
+    Header
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -28,12 +37,15 @@ SessionLocal = sessionmaker(bind=engine)
 
 
 def get_db():
-    """Ensures DB sessions are properly created & closed."""
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
+
+# Load admin key from environment
+ADMIN_KEY = os.getenv("ADMIN_KEY")
 
 
 # -------------------------------------------------
@@ -45,6 +57,9 @@ class User(Base):
 
     user_id = Column(String, primary_key=True, index=True)
 
+    # Permanent UUID auth token
+    auth_token = Column(String, nullable=True)
+
     # data_peek
     first_name = Column(String, nullable=True)
     last_name = Column(String, nullable=True)
@@ -54,6 +69,8 @@ class User(Base):
     birthday_month = Column(Integer, nullable=True)
     birthday_day = Column(Integer, nullable=True)
     address = Column(String, nullable=True)
+
+    # timestamps (not returned)
     data_peek_updated_at = Column(DateTime, default=datetime.utcnow)
 
     # note_peek
@@ -71,7 +88,6 @@ class User(Base):
     command = Column(String, nullable=True)
     command_updated_at = Column(DateTime, default=datetime.utcnow)
 
-    # internal timestamps (not returned to client)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
@@ -80,30 +96,35 @@ Base.metadata.create_all(bind=engine)
 
 
 # -------------------------------------------------
-# Pydantic Output Models (NO TIMESTAMPS)
+# Pydantic Models
 # -------------------------------------------------
 
 class UserSnapshot(BaseModel):
     user_id: str
 
-    # data_peek
     first_name: Optional[str]
     last_name: Optional[str]
     phone_number: Optional[str]
     birthday: Optional[str]
     address: Optional[str]
 
-    # note_peek
     note_name: Optional[str]
     note_body: Optional[str]
 
-    # screen_peek
     contact: Optional[str]
     screenshot_path: Optional[str]
     url: Optional[str]
 
-    # commands
     command: Optional[str]
+
+
+class CreateUserRequest(BaseModel):
+    user_id: str
+
+
+class LoginRequest(BaseModel):
+    user_id: str
+    token: str
 
 
 class DataPeekUpdate(BaseModel):
@@ -124,13 +145,16 @@ class CommandUpdate(BaseModel):
 
 
 # -------------------------------------------------
-# Helpers
+# Helper Functions
 # -------------------------------------------------
 
 def get_or_create_user(db, user_id: str):
     user = db.query(User).filter(User.user_id == user_id).first()
     if not user:
-        user = User(user_id=user_id)
+        user = User(
+            user_id=user_id,
+            auth_token=str(uuid.uuid4())
+        )
         db.add(user)
         db.commit()
         db.refresh(user)
@@ -143,49 +167,64 @@ def delete_screenshot_file(path: Optional[str]):
 
 
 def parse_partial_birthday(raw: str):
-    """
-    Accepts:
-      MM-DD
-      YYYY-MM-DD
-      YYYY-MM
-      DD-MM (fallback)
-    Returns components or raises 400.
-    """
     try:
         parts = raw.split("-")
 
-        if len(parts) == 2:  # MM-DD or DD-MM fallback
+        if len(parts) == 2:
             a, b = int(parts[0]), int(parts[1])
             if 1 <= a <= 12:
-                return None, a, b  # month-day
-            return None, b, a  # fallback day-month
+                return None, a, b
+            return None, b, a
 
-        elif len(parts) == 3:  # YYYY-MM-DD
+        elif len(parts) == 3:
             y, m, d = map(int, parts)
             return y, m, d
 
-        elif len(parts) == 2:  # YYYY-MM
+        elif len(parts) == 2:
             y, m = map(int, parts)
             return y, m, None
 
         else:
-            raise ValueError("Invalid format")
+            raise ValueError()
 
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid birthday format")
 
 
 def format_birthday_for_output(user):
-    """Returns 'Mar 6 2008' or 'Mar 6' or raw string."""
     if user.birthday_month and user.birthday_day:
         month_name = calendar.month_abbr[user.birthday_month]
-
         if user.birthday_year:
             return f"{month_name} {user.birthday_day} {user.birthday_year}"
-
         return f"{month_name} {user.birthday_day}"
-
     return user.birthday
+
+
+# -------------------------------------------------
+# Authentication Dependency
+# -------------------------------------------------
+
+def verify_token(
+    user_id: str,
+    authorization: str = Header(None),
+    db=Depends(get_db)
+):
+    """
+    Ensures the user provides the correct permanent auth token.
+    """
+    if authorization is None or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid token")
+
+    token = authorization.split("Bearer ")[1].strip()
+
+    user = db.query(User).filter(User.user_id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if user.auth_token != token:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    return user
 
 
 # -------------------------------------------------
@@ -216,11 +255,67 @@ def root():
 
 
 # -------------------------------------------------
-# Full User Snapshot (No Timestamps)
+# AUTH ROUTES
+# -------------------------------------------------
+
+@app.post("/auth/create_user")
+def create_user(
+    payload: CreateUserRequest,
+    authorization: str = Header(None),
+    db=Depends(get_db)
+):
+    # Require admin key
+    if ADMIN_KEY is None:
+        raise HTTPException(status_code=500, detail="ADMIN_KEY not set")
+
+    if authorization != f"Bearer {ADMIN_KEY}":
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+
+    # If user exists, refresh their token
+    existing = db.query(User).filter(User.user_id == payload.user_id).first()
+    if existing:
+        existing.auth_token = str(uuid.uuid4())
+        db.commit()
+        return {
+            "user_id": payload.user_id,
+            "token": existing.auth_token
+        }
+
+    # Create new user
+    user = User(
+        user_id=payload.user_id,
+        auth_token=str(uuid.uuid4())
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    return {
+        "user_id": payload.user_id,
+        "token": user.auth_token
+    }
+
+
+@app.post("/auth/login")
+def login(payload: LoginRequest, db=Depends(get_db)):
+    user = db.query(User).filter(User.user_id == payload.user_id).first()
+
+    if not user or user.auth_token != payload.token:
+        raise HTTPException(status_code=401, detail="Invalid login")
+
+    return {"status": "login_success"}
+
+
+# -------------------------------------------------
+# USER SNAPSHOT
 # -------------------------------------------------
 
 @app.get("/user/{user_id}", response_model=UserSnapshot)
-def get_user_snapshot(user_id: str, db=Depends(get_db)):
+def get_user_snapshot(
+    user_id: str,
+    db=Depends(get_db),
+    user=Depends(verify_token)
+):
     user = get_or_create_user(db, user_id)
 
     return UserSnapshot(
@@ -239,25 +334,12 @@ def get_user_snapshot(user_id: str, db=Depends(get_db)):
     )
 
 
-@app.delete("/user/{user_id}")
-def delete_user(user_id: str, db=Depends(get_db)):
-    user = db.query(User).filter(User.user_id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    delete_screenshot_file(user.screenshot_path)
-    db.delete(user)
-    db.commit()
-
-    return {"status": "deleted", "user_id": user_id}
-
-
 # -------------------------------------------------
-# data_peek
+# DATA PEEK
 # -------------------------------------------------
 
 @app.get("/data_peek/{user_id}")
-def get_data_peek(user_id: str, db=Depends(get_db)):
+def get_data_peek(user_id: str, user=Depends(verify_token), db=Depends(get_db)):
     user = get_or_create_user(db, user_id)
 
     return {
@@ -270,7 +352,12 @@ def get_data_peek(user_id: str, db=Depends(get_db)):
 
 
 @app.post("/data_peek/{user_id}")
-def update_data_peek(user_id: str, payload: DataPeekUpdate, db=Depends(get_db)):
+def update_data_peek(
+    user_id: str,
+    payload: DataPeekUpdate,
+    user_token=Depends(verify_token),
+    db=Depends(get_db)
+):
     user = get_or_create_user(db, user_id)
 
     if payload.birthday:
@@ -286,14 +373,17 @@ def update_data_peek(user_id: str, payload: DataPeekUpdate, db=Depends(get_db)):
             setattr(user, field, value)
 
     user.data_peek_updated_at = datetime.utcnow()
-    user.updated_at = datetime.utcnow()
     db.commit()
 
     return {"status": "updated"}
 
 
 @app.post("/data_peek/{user_id}/clear")
-def clear_data_peek(user_id: str, db=Depends(get_db)):
+def clear_data_peek(
+    user_id: str,
+    user_token=Depends(verify_token),
+    db=Depends(get_db)
+):
     user = get_or_create_user(db, user_id)
 
     user.first_name = None
@@ -307,16 +397,15 @@ def clear_data_peek(user_id: str, db=Depends(get_db)):
 
     user.data_peek_updated_at = datetime.utcnow()
     db.commit()
-
     return {"status": "cleared"}
 
 
 # -------------------------------------------------
-# note_peek
+# NOTE PEEK
 # -------------------------------------------------
 
 @app.get("/note_peek/{user_id}")
-def get_note_peek(user_id: str, db=Depends(get_db)):
+def get_note_peek(user_id: str, user=Depends(verify_token), db=Depends(get_db)):
     user = get_or_create_user(db, user_id)
 
     return {
@@ -326,7 +415,12 @@ def get_note_peek(user_id: str, db=Depends(get_db)):
 
 
 @app.post("/note_peek/{user_id}")
-def update_note_peek(user_id: str, payload: NotePeekUpdate, db=Depends(get_db)):
+def update_note_peek(
+    user_id: str,
+    payload: NotePeekUpdate,
+    user_token=Depends(verify_token),
+    db=Depends(get_db)
+):
     user = get_or_create_user(db, user_id)
 
     if payload.note_name is not None:
@@ -335,14 +429,17 @@ def update_note_peek(user_id: str, payload: NotePeekUpdate, db=Depends(get_db)):
         user.note_body = payload.note_body
 
     user.note_peek_updated_at = datetime.utcnow()
-    user.updated_at = datetime.utcnow()
     db.commit()
 
     return {"status": "updated"}
 
 
 @app.post("/note_peek/{user_id}/clear")
-def clear_note_peek(user_id: str, db=Depends(get_db)):
+def clear_note_peek(
+    user_id: str,
+    user_token=Depends(verify_token),
+    db=Depends(get_db)
+):
     user = get_or_create_user(db, user_id)
 
     user.note_name = None
@@ -354,11 +451,11 @@ def clear_note_peek(user_id: str, db=Depends(get_db)):
 
 
 # -------------------------------------------------
-# screen_peek
+# SCREEN PEEK
 # -------------------------------------------------
 
 @app.get("/screen_peek/{user_id}")
-def get_screen_peek(user_id: str, db=Depends(get_db)):
+def get_screen_peek(user_id: str, user=Depends(verify_token), db=Depends(get_db)):
     user = get_or_create_user(db, user_id)
 
     return {
@@ -369,7 +466,11 @@ def get_screen_peek(user_id: str, db=Depends(get_db)):
 
 
 @app.get("/screen_peek/{user_id}/screenshot")
-def download_screenshot(user_id: str, db=Depends(get_db)):
+def download_screenshot(
+    user_id: str,
+    user=Depends(verify_token),
+    db=Depends(get_db)
+):
     user = get_or_create_user(db, user_id)
 
     if not user.screenshot_path or not os.path.exists(user.screenshot_path):
@@ -384,6 +485,7 @@ async def update_screen_peek(
     screenshot: UploadFile = File(None),
     contact: Optional[str] = Form(None),
     url: Optional[str] = Form(None),
+    user_token=Depends(verify_token),
     db=Depends(get_db)
 ):
     user = get_or_create_user(db, user_id)
@@ -407,14 +509,17 @@ async def update_screen_peek(
         user.url = url
 
     user.screen_peek_updated_at = datetime.utcnow()
-    user.updated_at = datetime.utcnow()
     db.commit()
 
     return {"status": "updated"}
 
 
 @app.post("/screen_peek/{user_id}/clear")
-def clear_screen_peek(user_id: str, db=Depends(get_db)):
+def clear_screen_peek(
+    user_id: str,
+    user_token=Depends(verify_token),
+    db=Depends(get_db)
+):
     user = get_or_create_user(db, user_id)
 
     delete_screenshot_file(user.screenshot_path)
@@ -429,29 +534,37 @@ def clear_screen_peek(user_id: str, db=Depends(get_db)):
 
 
 # -------------------------------------------------
-# commands
+# COMMANDS
 # -------------------------------------------------
 
 @app.get("/commands/{user_id}")
-def get_commands(user_id: str, db=Depends(get_db)):
+def get_commands(user_id: str, user=Depends(verify_token), db=Depends(get_db)):
     user = get_or_create_user(db, user_id)
     return {"command": user.command}
 
 
 @app.post("/commands/{user_id}")
-def update_commands(user_id: str, payload: CommandUpdate, db=Depends(get_db)):
+def update_commands(
+    user_id: str,
+    payload: CommandUpdate,
+    user_token=Depends(verify_token),
+    db=Depends(get_db)
+):
     user = get_or_create_user(db, user_id)
 
     user.command = payload.command
     user.command_updated_at = datetime.utcnow()
-    user.updated_at = datetime.utcnow()
     db.commit()
 
     return {"status": "updated"}
 
 
 @app.post("/commands/{user_id}/clear")
-def clear_commands(user_id: str, db=Depends(get_db)):
+def clear_commands(
+    user_id: str,
+    user_token=Depends(verify_token),
+    db=Depends(get_db)
+):
     user = get_or_create_user(db, user_id)
 
     user.command = None
@@ -462,14 +575,13 @@ def clear_commands(user_id: str, db=Depends(get_db)):
 
 
 # -------------------------------------------------
-# clear_all
+# CLEAR ALL
 # -------------------------------------------------
 
 @app.post("/clear_all/{user_id}")
-def clear_all(user_id: str, db=Depends(get_db)):
+def clear_all(user_id: str, user=Depends(verify_token), db=Depends(get_db)):
     user = get_or_create_user(db, user_id)
 
-    # Clear data_peek
     user.first_name = None
     user.last_name = None
     user.phone_number = None
@@ -479,17 +591,14 @@ def clear_all(user_id: str, db=Depends(get_db)):
     user.birthday_day = None
     user.address = None
 
-    # Clear note_peek
     user.note_name = None
     user.note_body = None
 
-    # Clear screen_peek
     delete_screenshot_file(user.screenshot_path)
     user.contact = None
     user.url = None
     user.screenshot_path = None
 
-    # Clear commands
     user.command = None
 
     user.updated_at = datetime.utcnow()
