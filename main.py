@@ -44,7 +44,7 @@ def get_db():
         db.close()
 
 
-# Load admin key from environment
+# ADMIN KEY (for creating users)
 ADMIN_KEY = os.getenv("ADMIN_KEY")
 
 
@@ -70,7 +70,6 @@ class User(Base):
     birthday_day = Column(Integer, nullable=True)
     address = Column(String, nullable=True)
 
-    # timestamps (not returned)
     data_peek_updated_at = Column(DateTime, default=datetime.utcnow)
 
     # note_peek
@@ -101,7 +100,6 @@ Base.metadata.create_all(bind=engine)
 
 class UserSnapshot(BaseModel):
     user_id: str
-
     first_name: Optional[str]
     last_name: Optional[str]
     phone_number: Optional[str]
@@ -201,27 +199,25 @@ def format_birthday_for_output(user):
 
 
 # -------------------------------------------------
-# Authentication Dependency
+# Token Verification
 # -------------------------------------------------
 
 def verify_token(
     user_id: str,
-    authorization: str = Header(None),
+    authorization: str = Header(None, alias="Authorization"),
     db=Depends(get_db)
 ):
-    """
-    Ensures the user provides the correct permanent auth token.
-    """
     if authorization is None or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid token")
 
     token = authorization.split("Bearer ")[1].strip()
 
     user = db.query(User).filter(User.user_id == user_id).first()
+
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if user.auth_token != token:
+    if token != user.auth_token:
         raise HTTPException(status_code=401, detail="Invalid token")
 
     return user
@@ -261,17 +257,15 @@ def root():
 @app.post("/auth/create_user")
 def create_user(
     payload: CreateUserRequest,
-    authorization: str = Header(None),
+    authorization: str = Header(None, alias="Authorization"),
     db=Depends(get_db)
 ):
-    # Require admin key
     if ADMIN_KEY is None:
         raise HTTPException(status_code=500, detail="ADMIN_KEY not set")
 
     if authorization != f"Bearer {ADMIN_KEY}":
         raise HTTPException(status_code=403, detail="Invalid admin key")
 
-    # If user exists, refresh their token
     existing = db.query(User).filter(User.user_id == payload.user_id).first()
     if existing:
         existing.auth_token = str(uuid.uuid4())
@@ -281,7 +275,6 @@ def create_user(
             "token": existing.auth_token
         }
 
-    # Create new user
     user = User(
         user_id=payload.user_id,
         auth_token=str(uuid.uuid4())
@@ -299,8 +292,7 @@ def create_user(
 @app.post("/auth/login")
 def login(payload: LoginRequest, db=Depends(get_db)):
     user = db.query(User).filter(User.user_id == payload.user_id).first()
-
-    if not user or user.auth_token != payload.token:
+    if not user or payload.token != user.auth_token:
         raise HTTPException(status_code=401, detail="Invalid login")
 
     return {"status": "login_success"}
@@ -330,7 +322,7 @@ def get_user_snapshot(
         contact=user.contact,
         screenshot_path=user.screenshot_path,
         url=user.url,
-        command=user.command,
+        command=user.command
     )
 
 
@@ -392,11 +384,12 @@ def clear_data_peek(
     user.birthday = None
     user.birthday_year = None
     user.birthday_month = None
-    user.birthday_day = None
+    user.bbirthday_day = None
     user.address = None
 
     user.data_peek_updated_at = datetime.utcnow()
     db.commit()
+
     return {"status": "cleared"}
 
 
@@ -527,6 +520,7 @@ def clear_screen_peek(
     user.contact = None
     user.url = None
     user.screenshot_path = None
+
     user.screen_peek_updated_at = datetime.utcnow()
     db.commit()
 
@@ -582,6 +576,7 @@ def clear_commands(
 def clear_all(user_id: str, user=Depends(verify_token), db=Depends(get_db)):
     user = get_or_create_user(db, user_id)
 
+    # Clear all fields
     user.first_name = None
     user.last_name = None
     user.phone_number = None
