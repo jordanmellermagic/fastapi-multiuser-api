@@ -1,5 +1,6 @@
 import os
 import shutil
+import calendar
 from datetime import datetime
 from typing import Optional
 
@@ -7,9 +8,11 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+
 from sqlalchemy import Column, Integer, String, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import create_engine
+
 
 # ---------------------------
 # Database Setup
@@ -25,7 +28,7 @@ SessionLocal = sessionmaker(bind=engine)
 
 
 # ---------------------------
-# Models
+# Database Model
 # ---------------------------
 
 class User(Base):
@@ -33,7 +36,7 @@ class User(Base):
 
     user_id = Column(String, primary_key=True, index=True)
 
-    # data_peek
+    # data_peek (no job_title)
     first_name = Column(String, nullable=True)
     last_name = Column(String, nullable=True)
     phone_number = Column(String, nullable=True)
@@ -42,7 +45,6 @@ class User(Base):
     birthday_month = Column(Integer, nullable=True)
     birthday_day = Column(Integer, nullable=True)
     address = Column(String, nullable=True)
-
     data_peek_updated_at = Column(DateTime, default=datetime.utcnow)
 
     # note_peek
@@ -145,26 +147,56 @@ def parse_partial_birthday(raw: str):
       YYYY-MM-DD
       YYYY-MM
       DD-MM (fallback)
-    Returns components or raises 400.
+    Returns: year, month, day (year may be None)
+    Raises: HTTP 400 if invalid
     """
+
     try:
         parts = raw.split("-")
 
-        if len(parts) == 2:  # MM-DD or DD-MM
+        # MM-DD or DD-MM
+        if len(parts) == 2:
             a, b = int(parts[0]), int(parts[1])
-            if 1 <= a <= 12:
-                return None, a, b  # month-day
-            return None, b, a  # fallback: day-month
+            if 1 <= a <= 12:     # MM-DD
+                return None, a, b
+            return None, b, a    # fallback: DD-MM
 
-        elif len(parts) == 3:  # YYYY-MM-DD
+        # YYYY-MM-DD
+        elif len(parts) == 3:
             y, m, d = map(int, parts)
             return y, m, d
+
+        # YYYY-MM
+        elif len(parts) == 2:
+            y, m = map(int, parts)
+            return y, m, None
 
         else:
             raise ValueError("Invalid format")
 
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid birthday format")
+
+
+def format_birthday_for_output(user):
+    """
+    Converts numeric birthday fields into "Mar 6 2008" or "Mar 6".
+    Falls back to raw string if incomplete.
+    """
+
+    # Need at least month + day
+    if user.birthday_month and user.birthday_day:
+        month_name = calendar.month_abbr[user.birthday_month]
+
+        # Full date available
+        if user.birthday_year:
+            return f"{month_name} {user.birthday_day} {user.birthday_year}"
+
+        # Only month + day
+        return f"{month_name} {user.birthday_day}"
+
+    # Fallback to raw
+    return user.birthday
 
 
 # ---------------------------
@@ -195,7 +227,7 @@ def root():
 
 
 # ---------------------------
-# Full User Snapshot Routes
+# Full User Snapshot
 # ---------------------------
 
 @app.get("/user/{user_id}", response_model=UserSnapshot)
@@ -208,7 +240,7 @@ def get_user_snapshot(user_id: str):
         first_name=user.first_name,
         last_name=user.last_name,
         phone_number=user.phone_number,
-        birthday=user.birthday,
+        birthday=format_birthday_for_output(user),
         address=user.address,
         data_peek_updated_at=user.data_peek_updated_at,
         note_name=user.note_name,
@@ -233,7 +265,6 @@ def delete_user(user_id: str):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Delete screenshot file if present
     delete_screenshot_file(user.screenshot_path)
 
     db.delete(user)
@@ -250,11 +281,12 @@ def delete_user(user_id: str):
 def get_data_peek(user_id: str):
     db = SessionLocal()
     user = get_user(db, user_id)
+
     return {
         "first_name": user.first_name,
         "last_name": user.last_name,
         "phone_number": user.phone_number,
-        "birthday": user.birthday,
+        "birthday": format_birthday_for_output(user),
         "address": user.address,
         "updated_at": user.data_peek_updated_at,
     }
@@ -311,6 +343,7 @@ def clear_data_peek(user_id: str):
 def get_note_peek(user_id: str):
     db = SessionLocal()
     user = get_user(db, user_id)
+
     return {
         "note_name": user.note_name,
         "note_body": user.note_body,
@@ -356,6 +389,7 @@ def clear_note_peek(user_id: str):
 def get_screen_peek(user_id: str):
     db = SessionLocal()
     user = get_user(db, user_id)
+
     return {
         "contact": user.contact,
         "url": user.url,
@@ -385,6 +419,7 @@ async def update_screen_peek(
     db = SessionLocal()
     user = get_user(db, user_id)
 
+    # Replace screenshot if uploaded
     if screenshot is not None:
         if user.screenshot_path:
             delete_screenshot_file(user.screenshot_path)
@@ -434,6 +469,7 @@ def clear_screen_peek(user_id: str):
 def get_commands(user_id: str):
     db = SessionLocal()
     user = get_user(db, user_id)
+
     return {"command": user.command, "updated_at": user.command_updated_at}
 
 
@@ -463,7 +499,7 @@ def clear_commands(user_id: str):
 
 
 # ---------------------------
-# Clear All
+# clear_all
 # ---------------------------
 
 @app.post("/clear_all/{user_id}")
